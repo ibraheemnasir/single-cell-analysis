@@ -1,0 +1,209 @@
+library(Seurat)
+library(ggplot2)
+library(tidyverse)
+library(gridExtra)
+library(stringr)
+library(sctransform)
+library(gridExtra)
+
+sessionInfo()
+#Matrix 1.6.1 was not compatible with Seurat v3/v4
+library(devtools)
+install_version("Matrix", version = "1.5.4")
+
+untar("GSE161529_RAW (2).tar")
+
+#Upload all the neccesary data sets to dir
+setwd("/rawdata")
+
+file_list <-list.files()
+
+#Create a for loop to iterate over each file
+for (file_name in file_list) {
+  
+  #Extract the patient information from the file name
+  file.label<- str_extract(file_name, ".{1,}(?=-\\w{5,})")
+  
+  patient.info<- str_extract(file_name, "^[^_]+")
+  
+  #if file name has barcode in it assign names to matrix and barcode
+  
+  if (grepl("barcodes.tsv.gz", file_name)) {
+    barcode_file <- file_name
+    matrix_file <- gsub("barcodes.tsv.gz", "matrix.mtx.gz", file_name)
+  } else {
+    # Skip files that are not barcode files
+    next
+  }
+  
+  # Read the features file
+  features_file <- "/home/inasir/PalDataAnalysis/features.tsv.gz"
+  
+  
+  #Read the barcode, features and matrix files
+  seurat_data <- ReadMtx(mtx = matrix_file,
+                        features = features_file,
+                        cells = barcode_file)
+  
+  #Create a seurat object
+  
+  seurat_object_name <- CreateSeuratObject(counts = seurat_data)
+  
+  #Name data as BRCA1 (B1) or Normal(N)
+  
+  seurat_object_name@meta.data$orig.ident <- str_extract(file.label, "[NB][0-9]+|N")
+  
+  #Name seurat object with patient info
+  
+  assign(patient.info, seurat_object_name)
+
+}
+
+#Merge all seurat objects for easy integration
+merged_seurat <- merge(GSM4909253, y = c(GSM4909254, GSM4909257, GSM4909261, GSM4909263, GSM4909265,
+                                         GSM4909266, GSM4909268, GSM4909270, GSM4909271, GSM4909272, GSM4909274, GSM4909276, 
+                                        GSM4909277, GSM4909278, GSM4909279, GSM4909280),
+                       add.cell.ids = ls()[6:22],
+                       project = "BC")
+
+#unique(merged_seurat@meta.data$Patient)
+
+#Add patient info to the object
+merged_seurat$sample <- rownames(merged_seurat@meta.data)
+
+merged_seurat@meta.data <- separate(merged_seurat@meta.data, col = 'sample', into = c('Patient', 'Barcode'), sep = "_")
+
+
+obj.list <- SplitObject(merged_seurat, split.by = 'Patient')
+for(i in 1:length(obj.list)){
+  #obj.list[[i]] <- NormalizeData(object = obj.list[[i]])
+  #obj.list[[i]] <- FindVariableFeatures(object = obj.list[[i]])
+  
+  #QC
+  obj.list[[i]][["percent.mt"]] <- PercentageFeatureSet(obj.list[[i]], pattern = "^MT-")
+  obj.list[[i]] <- subset(obj.list[[i]], subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+  
+  #Normalize
+  #Using SCTransform to replace ScaleData(), NormalizeData() and FindVariableFeatures()
+  obj.list[[i]] <- SCTransform(obj.list[[i]], vars.to.regress = "percent.mt", verbose = FALSE)
+  
+  #Scale and PCA
+  obj.list[[i]] <- RunPCA(object = obj.list[[i]])
+  
+  #Clustering
+  obj.list[[i]] <- FindNeighbors(obj.list[[i]], dims = 1:30)
+  obj.list[[i]] <- FindClusters(obj.list[[i]], resolution = 0.5)
+  
+  obj.list[[i]] <- RunUMAP(obj.list[[i]], dims = 1:30)
+  
+}
+
+library(writexl)
+
+# Create a directory to store the Excel files
+dir.create("marker_results", showWarnings = FALSE)
+
+# Iterate over the list of Seurat objects
+for (i in seq_along(obj.list)) {
+  # Perform FindAllMarkers()
+  markers <- FindAllMarkers(obj.list[[i]], only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+  
+  cluster_markers <- markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC)
+  
+  # Generate a unique file name based on the object and analysis
+  file_name <- paste0("marker_results_", i, ".xlsx")
+  
+  # Write the results to a separate Excel file
+  write_xlsx(list(cluster_markers), path = file.path("marker_results", file_name))
+}
+
+#Redundant testing for macrophage specific markers
+for (i in seq_along(obj.list)) {
+  
+  #Set assay to RNA
+  DefaultAssay(obj.list[[i]]) <- 'RNA'
+  
+  #Identifying genes for macrophages - genes from Laviron et al Cell 2022 (https://doi.org/10.1016/j.celrep.2022.110865)
+  mac_genes_1 = c("PTPRC", "CD68", "CSF1R", "FCGR1A")
+  
+  #Genes from Yin Li et al (10.1080/07853890.2021.1914343)
+  mac_genes_2 = c("SERPINA1", "CD74", "STX11", "ADAM9", "CD24", "NFKBIA", "PGK1")
+  
+  # Create the violin plot using VlnPlot
+  vln_plot <- VlnPlot(obj.list[[i]], features = c(mac_genes_1, mac_genes_2))
+  
+  # Save the violin plot as an image file (e.g., PNG) with a name based on the object
+  file_name <- paste0("violin_plot_", i, ".png")
+  ggsave(file_name, vln_plot, width = 8, height = 6)
+  
+}
+
+for (i in seq_along(obj.list)) {
+  
+  DefaultAssay(obj.list[[i]]) <- 'RNA'
+  
+  #Identifying genes for macrophages - genes from Mulder et al (https://doi.org/10.1016/j.immuni.2021.07.007)
+  mac_genes_3 = c("C1QC", "C1QA")
+  
+  vln_plot <- VlnPlot(obj.list[[i]], features = c(mac_genes_3))
+  
+  # Save the violin plot as an image file (e.g., PNG) with a name based on the object
+  file_name <- paste0("violin_plot_C1QC", i, ".png")
+  ggsave(file_name, vln_plot, width = 8, height = 6)
+  
+}
+
+#7 data sets did not have discernable macrophage clusters
+#Manually identified the position of datasets in obj_list that contain macrophage clusters
+mac_seurats <- c(1,2,4,6,7,8,13,15,16,17)
+
+#Manually identified the cluster ident in each data sets 
+mac_ident <- c(8,10,7,7,4,10,7,11,11,10)
+
+#Subset macrophage clusters identified from above analysis from each data set into an object list
+#Initialise the list
+subset_obj.list <- list()
+
+#Initialise variables
+i <- 1
+x <- 1
+
+#Iterate across macrophage clusters in datasets with the clusters and identify if there are more than 50 cells
+while (i <= 10) {
+  
+  if ((sum(obj.list[[mac_seurats[i]]]@meta.data$seurat_clusters == mac_ident[i])) > 50)
+  {
+    #If more than 50 cells, subset the macrophage cluster and add to a new object list
+    subset_obj.list[[x]] <- subset(x = obj.list[[mac_seurats[i]]], ident = mac_ident[i])
+    x <- x + 1
+  }
+  
+  i <- i+1
+  
+}
+
+#Perform integration on all macrophage clusters
+
+#Select integration features
+features <- SelectIntegrationFeatures(object.list = subset_obj.list)
+
+#Find integration anchors (CCA)
+anchors <- FindIntegrationAnchors(object.list = subset_obj.list,
+                                  anchor.features = features)
+
+#Integrate data - kweight adjusted to 50 - subsets don't have enough cells - not ideal
+seurat.integrated <- IntegrateData(anchorset = anchors, k.weight = 50)
+
+# Scale data, run PCA and UMAP and visualize integrated data
+seurat.integrated <- ScaleData(object = seurat.integrated)
+seurat.integrated <- RunPCA(object = seurat.integrated)
+ElbowPlot(seurat.integrated, ndims = 30)
+seurat.integrated <- RunUMAP(object = seurat.integrated, dims = 1:10)
+
+
+p3 <- DimPlot(seurat.integrated, reduction = 'umap')
+
+
+DimPlot(obj.list[[16]], reduction = 'umap' )
